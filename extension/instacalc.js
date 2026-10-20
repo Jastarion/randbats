@@ -1,155 +1,293 @@
-var TOOLTIPMOVE = undefined;
-try { TOOLTIPMOVE = BattleTooltips.prototype.showMoveTooltip; } catch {}
+// Wrapped in an IIFE so none of these helpers leak into the global scope
+// (avoids clashing with same-named globals such as getStats in other scripts).
+(function () {
+  var TOOLTIPMOVE = undefined;
+  var TOOLTIPPOKEMON = undefined;
+  try { TOOLTIPMOVE = BattleTooltips.prototype.showMoveTooltip; } catch (e) {}
+  try { TOOLTIPPOKEMON = BattleTooltips.prototype.showPokemonTooltip; } catch (e) {}
 
-if (TOOLTIP&&TOOLTIPMOVE) {
-  BattleTooltips.prototype.showMoveTooltip = function (clientMove, serverMove, clientPokemon, serverPokemon) {
-    var original = TOOLTIPMOVE.apply(this, arguments);
-    try {
-      if(clientMove.basePower == 0 ||clientMove.basePower == null || clientMove.basePower > undefined){
+  // Showdown client weather ids -> @smogon/calc weather names
+  var CALC_WEATHER = {
+    sunnyday: 'Sun',
+    raindance: 'Rain',
+    sandstorm: 'Sand',
+    hail: 'Hail',
+    snow: 'Snow',
+    snowscape: 'Snow',
+    desolateland: 'Harsh Sunshine',
+    primordialsea: 'Heavy Rain',
+    deltastream: 'Strong Winds'
+  };
+
+  var CALC_TERRAINS = ['Electric', 'Grassy', 'Misty', 'Psychic'];
+
+  // Resolves the key used to look a species up in the randbats DATA tables
+  function getSpeciesId(species) {
+    var cosmetic = species.cosmeticFormes && species.cosmeticFormes.includes(species.name);
+    var id = toID((species.forme === 'Gmax' || cosmetic)
+      ? species.baseSpecies : species.battleOnly || species.name);
+    if (id.startsWith('pikachu')) id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
+    return id;
+  }
+
+  // Builds the EVs / IVs / boosts objects the calc expects
+  function getEvsIvsBoosts(stats, data, pokemonBoosts, gen, letsgo, champions) {
+    var evs = {};
+    var ivs = {};
+    var boosts = {};
+    pokemonBoosts = pokemonBoosts || {};
+    for (var stat in stats) {
+      ivs[stat] = 'ivs' in data && stat in data.ivs ? data.ivs[stat] : (gen < 3 ? 30 : 31);
+      evs[stat] = 'evs' in data && stat in data.evs ? data.evs[stat] : (gen < 3 ? 255 : letsgo ? 0 : champions ? 11 : 85);
+      if (pokemonBoosts[stat]) boosts[stat] = pokemonBoosts[stat];
+    }
+    return { evs: evs, ivs: ivs, boosts: boosts };
+  }
+
+  // Works out which DATA table to use for the current battle (null = unsupported format)
+  function getFormatInfo(battle) {
+    var format = toID(battle.tier);
+    if (!format || !format.includes('random')) return null;
+
+    var gen = Number(format.charAt(3));
+    var letsgo = format.includes('letsgo');
+    var champions = format.includes('champions');
+    var gameType = battle.gameType;
+
+    if (!['singles', 'doubles'].includes(gameType)) {
+      format = 'gen' + gen + (champions ? 'champions' : '') + 'randomdoublesbattle';
+    } else if (format.includes('monotype') || format.includes('unrated')) {
+      format = 'gen' + gen + (champions ? 'champions' : '') + 'randombattle';
+    } else if (format.endsWith('blitz')) {
+      format = format.slice(0, -5);
+    }
+    if (!DATA[format]) return null;
+
+    return { format: format, gen: gen, letsgo: letsgo, champions: champions };
+  }
+
+  // Looks up the randbats set data for a species at a given level
+  function getSetData(info, species, level) {
+    var byLevel = DATA[info.format][species.name === 'Zoroark' ? 0 : level];
+    if (!byLevel) return null;
+    return byLevel[getSpeciesId(species)] || null;
+  }
+
+  function buildField(battle) {
+    var mySide = battle.mySide;
+    var farSide = battle.farSide;
+
+    // Terrain: pseudoWeather entries look like ['Electric Terrain', ...]
+    var terrainEntry = (battle.pseudoWeather || []).find(function (p) {
+      return /terrain/i.test(p[0]);
+    });
+    var terrain = terrainEntry ? terrainEntry[0].replace(/\s*terrain/i, '') : undefined;
+    if (CALC_TERRAINS.indexOf(terrain) === -1) terrain = undefined;
+
+    return new calc.Field({
+      attackerSide: {
+        isLightScreen: !!(mySide.sideConditions.auroraveil || mySide.sideConditions.lightscreen),
+        isReflect: !!(mySide.sideConditions.auroraveil || mySide.sideConditions.reflect)
+      },
+      defenderSide: {
+        isLightScreen: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.lightscreen),
+        isReflect: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.reflect)
+      },
+      weather: CALC_WEATHER[battle.weather],
+      terrain: terrain
+    });
+  }
+
+  // p = { species, set, item, ability, boosts }
+  function makePokemon(info, calcGen, p) {
+    var stats = getEvsIvsBoosts(p.species.baseStats, p.set[0], p.boosts, info.gen, info.letsgo, info.champions);
+    return new calc.Pokemon(calcGen, p.species.name, {
+      item: p.item,
+      ability: p.ability,
+      level: p.set[0].level,
+      evs: stats.evs,
+      ivs: stats.ivs,
+      boosts: stats.boosts
+    });
+  }
+
+  // Returns [min%, max%] of the defender's max HP, or null if it couldn't be computed
+  function getDamageRange(result) {
+    var hp = parseInt(result["defender"]["stats"]["hp"]);
+    var dmg = result["damage"];
+    var min = Math.round(parseInt(dmg[0]) / hp * 1000) / 10;
+    var max = Math.round(parseInt(dmg[dmg.length - 1]) / hp * 1000) / 10;
+    if (!isFinite(min) || !isFinite(max)) return null;
+    return [min, max];
+  }
+
+  function calcMoveRange(battle, info, attacker, defender, moveName) {
+    var calcGen = calc.Generations.get(info.gen);
+    var result = calc.calculate(
+      calcGen,
+      makePokemon(info, calcGen, attacker),
+      makePokemon(info, calcGen, defender),
+      new calc.Move(calcGen, moveName),
+      buildField(battle)
+    );
+    console.debug(result);
+    return getDamageRange(result);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Move tooltip (hovering a move button for the Pokémon that is out)
+  // ---------------------------------------------------------------------------
+  if (TOOLTIPMOVE) {
+    BattleTooltips.prototype.showMoveTooltip = function (clientMove, serverMove, clientPokemon, serverPokemon) {
+      var original = TOOLTIPMOVE.apply(this, arguments);
+      try {
+        // Skip status moves / moves with no base power
+        if (clientMove.basePower == 0 || clientMove.basePower == null) return original;
+        if (!serverPokemon) return original;
+
+        var battle = this.battle;
+        var enemy = battle.farSide.active[0];
+        var me = battle.mySide.active[0];
+        if (!enemy || !me) return original;
+
+        var info = getFormatInfo(battle);
+        if (!info) return original;
+
+        var speciesEnemy = Dex.species.get(enemy.speciesForme);
+        if (!speciesEnemy) return original;
+        var speciesMe = Dex.species.get(me.speciesForme);
+        if (!speciesMe) return original;
+
+        var dataEnemy = getSetData(info, speciesEnemy, enemy.level);
+        if (!dataEnemy) return original;
+        var dataMe = getSetData(info, speciesMe, me.level);
+        if (!dataMe) return original;
+
+        var range = calcMoveRange(
+          battle, info,
+          {
+            species: speciesMe,
+            set: dataMe,
+            item: BattleItems[serverPokemon.item]?.name,
+            ability: BattleAbilities[serverPokemon.baseAbility]?.name,
+            boosts: clientPokemon && clientPokemon.boosts
+          },
+          {
+            species: speciesEnemy,
+            set: dataEnemy,
+            item: "mail",
+            boosts: enemy.boosts
+          },
+          clientMove.name
+        );
+        if (!range) return original;
+
+        /*
+        TODO: dynamax and tera
+        var bp = clientMove.basePower;
+        if(serverMove === 'maxmove'){
+          clientMove.basePower = clientMove.maxMove.basePower;
+          buf += getItemModi(statsMe,statsEnemy,dataEnemy, dataMe, serverPokemon, me, enemy, this.getPokemonTypes(me), this.getPokemonTypes(enemy),clientMove,this.battle, true)
+          clientMove.basePower = bp;
+        }
+        else{
+          buf += getItemModi(statsMe,statsEnemy,dataEnemy, dataMe, serverPokemon, me, enemy, this.getPokemonTypes(me), this.getPokemonTypes(enemy),clientMove,this.battle, false)
+        }
+        */
+
+        var buf = original;
+        buf += '<div style="border-top: 1px solid #888; background: #dedede">';
+        buf += '<p><small>Damage:</small> ' + range[0] + '% - ' + range[1] + '% </p>';
+        buf += '</div>';
+        return buf;
+      } catch (e) {
+        console.debug(e);
         return original;
       }
-      var farSide = this.battle.farSide;
-      var mySide = this.battle.mySide;
-      var enemy = farSide.active[0];
-      var me = mySide.active[0];
-      var format = toID(this.battle.tier);
-      if (!format || !format.includes('random')) return original;
-
-
-      var speciesEnemy = Dex.species.get(enemy.speciesForme);
-      if (!speciesEnemy) return original;
-      var speciesMe = Dex.species.get(me.speciesForme);
-      if (!speciesMe) return original;
-
-      var gen = Number(format.charAt(3));
-      var letsgo = format.includes('letsgo');
-      var champions = format.includes('champions');
-      var gameType = this.battle.gameType;
-
-      if (!['singles', 'doubles'].includes(gameType)) {
-        format = 'gen' + gen + (champions ? 'champions' : '') + 'randomdoublesbattle';
-      } else if (format.includes('monotype') || format.includes('unrated')) {
-        format = 'gen' + gen + (champions ? 'champions' : '') + 'randombattle';
-      } else if (format.endsWith('blitz')) {
-        format = format.slice(0, -5);
-      }
-      if (!DATA[format]) return original;
-
-
-      // Enemy Stats
-      var dataEnemy = DATA[format][speciesEnemy.name === 'Zoroark' ? 0 : enemy.level];
-      if (!dataEnemy) return original;
-
-      var cosmetic = speciesEnemy.cosmeticFormes && speciesEnemy.cosmeticFormes.includes(speciesEnemy.name);
-      var idEnemy = toID((speciesEnemy.forme === 'Gmax' || cosmetic)
-        ? speciesEnemy.baseSpecies : speciesEnemy.battleOnly || speciesEnemy.name);
-      if (idEnemy.startsWith('pikachu')) idEnemy = idEnemy.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
-      var forme = cosmetic ? speciesEnemy.baseSpecies : enemy.speciesForme;
-      if (forme.startsWith('Pikachu')) forme = forme.endsWith('Gmax') ? 'Pikachu-Gmax' : 'Pikachu';
-
-      dataEnemy = dataEnemy[idEnemy];
-      if (!dataEnemy) return original;
-
-
-
-
-
-      // Me
-      //var statsEnemy = getStats(gen, gameType, letsgo, speciesEnemy, dataEnemy[0], null , this.getPokemonTypes(enemy),enemy);
-
-      var dataMe = DATA[format][speciesMe.name === 'Zoroark' ? 0 : me.level];
-      if (!dataMe) return original;
-
-      var cosmetic = speciesMe.cosmeticFormes && speciesMe.cosmeticFormes.includes(speciesMe.name);
-      var idMe = toID((speciesMe.forme === 'Gmax' || cosmetic)
-        ? speciesMe.baseSpecies : speciesMe.battleOnly || speciesMe.name);
-      if (idMe.startsWith('pikachu')) idMe = idMe.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
-      var forme = cosmetic ? speciesMe.baseSpecies : me.speciesForme;
-      if (forme.startsWith('Pikachu')) forme = forme.endsWith('Gmax') ? 'Pikachu-Gmax' : 'Pikachu';
-      dataMe = dataMe[idMe];
-      if (!dataMe) return original;
-      var buf = original;
-
-      const calcGen = calc.Generations.get(gen);
-
-      function getStats(stats, data, pokemonBoosts) {
-        var evs = {};
-        var ivs = {};
-        var boosts = {};
-        //todo
-        if(Object.keys(pokemonBoosts).length != 0){
-          for (var stat in stats) {
-            ivs[stat] = 'ivs' in data && stat in data.ivs ? data.ivs[stat] : (gen < 3 ? 30 : 31);
-            evs[stat] = 'evs' in data && stat in data.evs ? data.evs[stat] : (gen < 3 ? 255 : letsgo ? 0 : champions ? 11 : 85);
-            if (pokemonBoosts[stat]) boosts[stat] = pokemonBoosts[stat];
-          }
-        } else {
-          for (var stat in stats) {
-            ivs[stat] = 'ivs' in data && stat in data.ivs ? data.ivs[stat] : (gen < 3 ? 30 : 31);
-            evs[stat] = 'evs' in data && stat in data.evs ? data.evs[stat] : (gen < 3 ? 255 : letsgo ? 0 : champions ? 11 : 85);
-          }
-        }
-        return {evs,ivs,boosts}
-      }
-
-      const statsMe = getStats(speciesMe.baseStats, dataMe[0], clientPokemon.boosts);
-      const statsEnemy = getStats(speciesEnemy.baseStats, dataEnemy[0], enemy.boosts);
-
-      const result = calc.calculate(
-        calcGen,
-        new calc.Pokemon(calcGen, speciesMe.name, {
-          item: BattleItems[serverPokemon.item].name,
-          ability: BattleAbilities[serverPokemon.baseAbility].name,
-          level: dataMe[0].level,
-          evs: statsMe["evs"],
-          ivs: statsMe["ivs"],
-          boosts: statsMe["boosts"]
-        }),
-        new calc.Pokemon(calcGen, speciesEnemy.name, {
-          item: "mail",
-          level: dataEnemy[0].level,
-          evs: statsEnemy["evs"],
-          ivs: statsEnemy["ivs"],
-          boosts: statsEnemy["boosts"]
-        }),
-        new calc.Move(calcGen, clientMove.name),
-        new calc.Field({
-          attackerSide: {
-            isLightScreen: (mySide.sideConditions.auroraveil || mySide.sideConditions.lightscreen) ? true : false,
-            isReflect: (mySide.sideConditions.auroraveil || mySide.sideConditions.reflect) ? true : false
-          },
-          defenderSide: {
-            isLightScreen: (farSide.sideConditions.auroraveil || farSide.sideConditions.lightscreen) ? true : false,
-            isReflect: (farSide.sideConditions.auroraveil || farSide.sideConditions.reflect) ? true : false
-          },
-          weather: this.battle.weather,
-          terrain: (this.battle.pseudoWeather.lenght!=0) ? this.battle.pseudoWeather[0] : ""
-        })
-      );
-
-      const dmg = new Array(2);
-      dmg[0] = Math.round(parseInt(result["damage"][0])/parseInt(result["defender"]["stats"]["hp"])*1000)/10;
-      dmg[1] = Math.round(parseInt(result["damage"][result["damage"].length-1])/parseInt(result["defender"]["stats"]["hp"])*1000)/10;
-      console.debug(result);
-      /*
-      TODO: dynamax and tera
-      var bp = clientMove.basePower;
-      if(serverMove === 'maxmove'){
-        clientMove.basePower = clientMove.maxMove.basePower;
-        buf += getItemModi(statsMe,statsEnemy,dataEnemy, dataMe, serverPokemon, me, enemy, this.getPokemonTypes(me), this.getPokemonTypes(enemy),clientMove,this.battle, true)
-        clientMove.basePower = bp;
-      }
-      else{
-        buf += getItemModi(statsMe,statsEnemy,dataEnemy, dataMe, serverPokemon, me, enemy, this.getPokemonTypes(me), this.getPokemonTypes(enemy),clientMove,this.battle, false)
-      }
-      */
-      buf += '<div style="border-top: 1px solid #888; background: #dedede">';
-      buf += '<p><small>Damage:</small> ' + dmg[0] + '% - ' + dmg[1] + '% </p>';
-
-      return buf;
-    } catch(e) {
-      console.debug(e);
-      return original;
     };
-  };
-};
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pokémon tooltip (hovering a team icon): damage for each move of one of my
+  // Pokémon that is NOT out, against the opponent's current active Pokémon.
+  // Added right after the moves list.
+  // ---------------------------------------------------------------------------
+  if (TOOLTIPPOKEMON) {
+    BattleTooltips.prototype.showPokemonTooltip = function (clientPokemon, serverPokemon, isActive) {
+      var original = TOOLTIPPOKEMON.apply(this, arguments);
+      try {
+        // Only my own Pokémon (their moves are known) that are not currently out.
+        // The Pokémon that is out already gets the calc on its move tooltips.
+        if (!serverPokemon || isActive || serverPokemon.active) return original;
+        if (!serverPokemon.moves || !serverPokemon.moves.length) return original;
+
+        var battle = this.battle;
+        var enemy = battle.farSide.active[0];
+        if (!enemy) return original;
+
+        var info = getFormatInfo(battle);
+        if (!info) return original;
+
+        var speciesEnemy = Dex.species.get(enemy.speciesForme);
+        if (!speciesEnemy) return original;
+        var speciesMe = Dex.species.get(serverPokemon.speciesForme || (clientPokemon && clientPokemon.speciesForme));
+        if (!speciesMe) return original;
+
+        var dataEnemy = getSetData(info, speciesEnemy, enemy.level);
+        if (!dataEnemy) return original;
+        var dataMe = getSetData(info, speciesMe, serverPokemon.level);
+        if (!dataMe) return original;
+
+        var attacker = {
+          species: speciesMe,
+          set: dataMe,
+          item: BattleItems[serverPokemon.item]?.name,
+          ability: BattleAbilities[serverPokemon.baseAbility]?.name
+        };
+        var defender = {
+          species: speciesEnemy,
+          set: dataEnemy,
+          item: "mail",
+          boosts: enemy.boosts
+        };
+
+        var rows = '';
+        var hasDamage = false;
+        for (var i = 0; i < serverPokemon.moves.length; i++) {
+          var move = Dex.moves.get(serverPokemon.moves[i]);
+          if (!move || !move.exists) continue;
+
+          var line = '&#8226; ' + move.name;
+          // Status moves and moves with no base power are listed without a number
+          if (move.basePower && move.category !== 'Status') {
+            try {
+              var range = calcMoveRange(battle, info, attacker, defender, move.name);
+              if (range) {
+                line += ': ' + range[0] + '% - ' + range[1] + '%';
+                hasDamage = true;
+              } else {
+                line += ': &mdash;';
+              }
+            } catch (e) {
+              console.debug(e);
+            }
+          }
+          rows += line + '<br />';
+        }
+        if (!hasDamage) return original;
+
+        var block = '<div style="border-top: 1px solid #888; background: #dedede">' +
+          '<p class="section"><small>Damage vs ' + speciesEnemy.name + ':</small><br />' + rows + '</p>' +
+          '</div>';
+
+        // Insert inside the tooltip, right after the moves (before the closing tags)
+        var end = /<\/div>\s*<\/div>\s*$/.exec(original);
+        if (end) return original.slice(0, end.index) + block + original.slice(end.index);
+        return original + block;
+      } catch (e) {
+        console.debug(e);
+        return original;
+      }
+    };
+  }
+})();
