@@ -158,7 +158,7 @@ if (TOOLTIP) {
           buf += '<p><small>Tera Types:</small> ' + display(role[1].teraTypes) + '</p>';
         }
         buf += '<p><small>Moves:</small> ' + display(role[1].moves, multi) + '</p>';
-        buf += displayStats(gen, letsgo, champions, species, role[1], data.level, noHP) + '</div>';
+        buf += displayStats(gen, letsgo, champions, species, role[1], data.level, noHP, clientPokemon) + '</div>';
         i++;
       }
     } else {
@@ -170,7 +170,7 @@ if (TOOLTIP) {
           (data.items ? display(data.items) : '(No Item)') + '</p>';
       }
       buf += '<p><small>Moves:</small> ' + display(data.moves, multi) + '</p>';
-      buf += displayStats(gen, letsgo, champions, species, data, data.level, noHP);
+      buf += displayStats(gen, letsgo, champions, species, data, data.level, noHP, clientPokemon);
     }
 
     if (typechartBool) {
@@ -194,7 +194,112 @@ if (TOOLTIP) {
     return buf;
   }
 
-  function displayStats(gen, letsgo, champions, species, data, level, noHP) {
+  // Works out the Pokémon's CURRENT Speed from its randbats base stat plus everything we can
+  // actually see: stat stages, paralysis, Tailwind, revealed items, weather / terrain abilities...
+  // Mirrors the order of operations of Showdown's own calculateModifiedStats.
+  // Returns { value, notes } where notes lists the modifiers that were applied.
+  function getEffectiveSpeed(clientPokemon, baseSpeed, data, gen) {
+    var battle = clientPokemon.side && clientPokemon.side.battle;
+    if (!battle) return null;
+
+    var notes = [];
+    var spe = baseSpeed;
+    var stage = clientPokemon.boosts && clientPokemon.boosts.spe;
+    var paralyzed = clientPokemon.status === 'par';
+
+    // Stat stages
+    if (stage) {
+      var boostTable = [1, 1.5, 2, 2.5, 3, 3.5, 4];
+      if (stage > 0) {
+        spe *= boostTable[stage];
+      } else {
+        if (gen <= 2) boostTable = [1, 100 / 66, 2, 2.5, 100 / 33, 100 / 28, 4];
+        spe /= boostTable[-stage];
+      }
+      spe = Math.floor(spe);
+      notes.push((stage > 0 ? '+' : '') + stage);
+    }
+
+    // Gen 1-2: only stages and paralysis matter
+    if (gen <= 2) {
+      if (paralyzed) {
+        spe = Math.floor(spe * 0.25);
+        notes.push('Paralysis');
+      }
+      if (gen <= 1 && spe > 999) spe = 999;
+      return { value: spe, notes: notes };
+    }
+
+    // Ability: use the revealed one, otherwise the only one this set can have
+    var ability = '';
+    var suppressed = clientPokemon.volatiles['gastroacid'] || (battle.ngasActive && battle.ngasActive());
+    if (!suppressed) {
+      ability = toID(clientPokemon.effectiveAbility ? clientPokemon.effectiveAbility() : clientPokemon.ability);
+      if (!ability && data && data.abilities) {
+        var possible = Object.keys(data.abilities).filter(function (a) { return data.abilities[a] > 0; });
+        if (possible.length === 1) ability = toID(possible[0]);
+      }
+    }
+
+    // Item: only if it has been revealed
+    var item = toID(clientPokemon.item);
+    var speedHalvingEVItems = [
+      'machobrace', 'poweranklet', 'powerband', 'powerbelt', 'powerbracer', 'powerlens', 'powerweight',
+    ];
+    if ((ability === 'klutz' && speedHalvingEVItems.indexOf(item) === -1) ||
+        battle.hasPseudoWeather('Magic Room') || clientPokemon.volatiles['embargo']) {
+      item = '';
+    }
+
+    var weather = battle.weather;
+    if (battle.abilityActive && battle.abilityActive(['Air Lock', 'Cloud Nine'])) weather = '';
+
+    var mods = []; // [multiplier, label]
+    var species = clientPokemon.getSpecies ? clientPokemon.getSpecies() : null;
+    if (species && species.baseSpecies === 'Ditto' && !clientPokemon.volatiles['transform'] && item === 'quickpowder') {
+      mods.push([2, 'Quick Powder']);
+    }
+    if (weather) {
+      if (ability === 'sandrush' && weather === 'sandstorm') mods.push([2, 'Sand Rush']);
+      if (ability === 'slushrush' && (weather === 'hail' || weather === 'snowscape')) mods.push([2, 'Slush Rush']);
+      if (item !== 'utilityumbrella') {
+        if (ability === 'chlorophyll' && (weather === 'sunnyday' || weather === 'desolateland')) mods.push([2, 'Chlorophyll']);
+        if (ability === 'swiftswim' && (weather === 'raindance' || weather === 'primordialsea')) mods.push([2, 'Swift Swim']);
+      }
+    }
+    if (clientPokemon.volatiles['slowstart']) mods.push([0.5, 'Slow Start']);
+    if (ability === 'unburden' && clientPokemon.volatiles['itemremoved'] && !item) mods.push([2, 'Unburden']);
+    if (clientPokemon.volatiles['protosynthesisspe'] || clientPokemon.volatiles['quarkdrivespe']) {
+      mods.push([1.5, ability === 'quarkdrive' ? 'Quark Drive' : 'Protosynthesis']);
+    }
+    if (clientPokemon.status && ability === 'quickfeet') mods.push([1.5, 'Quick Feet']);
+    if (ability === 'surgesurfer' && battle.hasPseudoWeather('Electric Terrain')) mods.push([2, 'Surge Surfer']);
+    if (item === 'choicescarf' && !clientPokemon.volatiles['dynamax']) mods.push([1.5, 'Choice Scarf']);
+    if (item === 'ironball' || speedHalvingEVItems.indexOf(item) !== -1) mods.push([0.5, 'Slowing item']);
+
+    // Side conditions of the Pokémon's OWN side
+    var sideConditions = (clientPokemon.side && clientPokemon.side.sideConditions) || {};
+    if (sideConditions['tailwind']) mods.push([2, 'Tailwind']);
+    if (sideConditions['grasspledge']) mods.push([0.25, 'Swamp']);
+
+    var chained = 1;
+    for (var i = 0; i < mods.length; i++) {
+      chained *= mods[i][0];
+      notes.push(mods[i][1]);
+    }
+    // Chained modifiers round down on 0.5
+    spe *= chained;
+    spe = spe % 1 > 0.5 ? Math.ceil(spe) : Math.floor(spe);
+
+    // Paralysis is applied last (Quick Feet ignores it)
+    if (paralyzed && ability !== 'quickfeet') {
+      spe = Math.floor(spe * (gen > 6 ? 0.5 : 0.25));
+      notes.push('Paralysis');
+    }
+    return { value: spe, notes: notes };
+  }
+
+  function displayStats(gen, letsgo, champions, species, data, level, noHP, clientPokemon) {
     var stats = {};
     for (var stat in species.baseStats) {
       stats[stat] = calcStat(
@@ -208,18 +313,43 @@ if (TOOLTIP) {
         champions);
     }
 
-    buf ='<p>';
-    for (var statName of Dex.statNamesExceptHP) {
-      if (gen === 1 && statName === 'spd') continue;
-      var known = gen === 1 || (gen === 2 && noHP) ||
-        ('ivs' in data && statName in data.ivs) || ('evs' in data && statName in data.evs);
-      var statLabel = gen === 1 && statName === 'spa' ? 'spc' : statName;
-      buf += statName === 'atk' ? '<small>' : '<small> / ';
-      buf += '' + BattleTextParser.statShortName(statLabel) + '&nbsp;</small>';
-      var italic = !known && (statName === 'atk' || statName === 'spe');
-      buf += (italic ? '<i>' : '') + stats[statName] + (italic ? '</i>' : '');
+    // The Pokémon's CURRENT Speed after stat stages, paralysis, Tailwind, etc.
+    var modifiedSpe = null;
+    if (clientPokemon) {
+      try {
+        var eff = getEffectiveSpeed(clientPokemon, stats.spe, data, gen);
+        if (eff && eff.value !== stats.spe) modifiedSpe = eff.value;
+      } catch (e) {
+        console.debug(e);
+      }
     }
-    buf += '</p>';
+
+    // Same layout Showdown uses for stat modifiers: the normal stat line, then
+    // "(After stat modifiers:)" and a second line where changed stats are green / red.
+    function statLine(useModified) {
+      var line = '<p>';
+      for (var statName of Dex.statNamesExceptHP) {
+        if (gen === 1 && statName === 'spd') continue;
+        var known = gen === 1 || (gen === 2 && noHP) ||
+          ('ivs' in data && statName in data.ivs) || ('evs' in data && statName in data.evs);
+        var statLabel = gen === 1 && statName === 'spa' ? 'spc' : statName;
+        line += statName === 'atk' ? '<small>' : '<small> / ';
+        line += '' + BattleTextParser.statShortName(statLabel) + '&nbsp;</small>';
+        var italic = !known && (statName === 'atk' || statName === 'spe');
+        var shown = '' + stats[statName];
+        if (useModified && statName === 'spe') {
+          shown = '<strong class="' + (modifiedSpe < stats.spe ? 'stat-lowered' : 'stat-boosted') + '">' +
+            modifiedSpe + '</strong>';
+        }
+        line += (italic ? '<i>' : '') + shown + (italic ? '</i>' : '');
+      }
+      return line + '</p>';
+    }
+
+    var buf = statLine(false);
+    if (modifiedSpe !== null) {
+      buf += '<p><small>(After stat modifiers:)</small></p>' + statLine(true);
+    }
     return buf;
   }
 
