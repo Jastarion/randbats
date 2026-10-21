@@ -98,25 +98,74 @@
     });
   }
 
-  // p = { species, set, item, ability, boosts }
+  // Returns the (capitalized) tera type of a Pokémon that is CURRENTLY terastallized, else undefined.
+  // Pass it the client's `terastallized` values only, never `teraType`: the calc treats any
+  // teraType it receives as already active, which would wrongly boost Pokémon that haven't terastallized.
+  function getTeraType() {
+    for (var i = 0; i < arguments.length; i++) {
+      var t = arguments[i];
+      if (t && typeof t === 'string') return t.charAt(0).toUpperCase() + t.slice(1);
+    }
+    return undefined;
+  }
+
+  var CALC_STATUSES = ['slp', 'psn', 'brn', 'frz', 'par', 'tox'];
+
+  // Status of a client Pokemon / ServerPokemon in the calc's format (undefined = healthy).
+  // This is what makes burn's attack drop, Guts, Facade, Hex, Venoshock... work.
+  function getCalcStatus(poke) {
+    var status = poke && poke.status;
+    return CALC_STATUSES.indexOf(status) !== -1 ? status : undefined;
+  }
+
+  // Current HP as a fraction of max HP (works for both real HP and percentage HP)
+  function getHpFraction(poke) {
+    return poke && poke.maxhp ? poke.hp / poke.maxhp : 1;
+  }
+
+  // p = { species, set, item, ability, boosts, teraType, status, hpFraction }
   function makePokemon(info, calcGen, p) {
     var stats = getEvsIvsBoosts(p.species.baseStats, p.set[0], p.boosts, info.gen, info.letsgo, info.champions);
-    return new calc.Pokemon(calcGen, p.species.name, {
+    var mon = new calc.Pokemon(calcGen, p.species.name, {
       item: p.item,
       ability: p.ability,
       level: p.set[0].level,
       evs: stats.evs,
       ivs: stats.ivs,
-      boosts: stats.boosts
+      boosts: stats.boosts,
+      // Giving the calc a teraType is what makes it treat the Pokémon as terastallized
+      // (Tera STAB x1.333, new defensive typing, Tera Blast...). Gen 9 only.
+      teraType: info.gen >= 9 ? p.teraType : undefined,
+      status: p.status
     });
+
+    // Current HP matters for Blaze/Torrent/Overgrow/Swarm, Eruption, Reversal, Brine...
+    if (mon.rawStats && p.hpFraction > 0 && p.hpFraction < 1) {
+      mon.originalCurHP = Math.max(1, Math.round(mon.rawStats.hp * p.hpFraction));
+    }
+    return mon;
   }
 
   // Returns [min%, max%] of the defender's max HP, or null if it couldn't be computed
   function getDamageRange(result) {
     var hp = parseInt(result["defender"]["stats"]["hp"]);
-    var dmg = result["damage"];
-    var min = Math.round(parseInt(dmg[0]) / hp * 1000) / 10;
-    var max = Math.round(parseInt(dmg[dmg.length - 1]) / hp * 1000) / 10;
+    var lo, hi;
+    if (typeof result.range === 'function') {
+      // Handles immunities (damage is a plain 0), multi-hit moves and Parental Bond
+      var r = result.range();
+      lo = r[0];
+      hi = r[1];
+    } else {
+      var dmg = result["damage"];
+      if (typeof dmg === 'number') {
+        lo = hi = dmg;
+      } else {
+        lo = parseInt(dmg[0]);
+        hi = parseInt(dmg[dmg.length - 1]);
+      }
+    }
+    var min = Math.round(lo / hp * 1000) / 10;
+    var max = Math.round(hi / hp * 1000) / 10;
     if (!isFinite(min) || !isFinite(max)) return null;
     return [min, max];
   }
@@ -168,15 +217,21 @@
           {
             species: speciesMe,
             set: dataMe,
-            item: BattleItems[serverPokemon.item]?.name,
-            ability: BattleAbilities[serverPokemon.baseAbility]?.name,
-            boosts: clientPokemon && clientPokemon.boosts
+            item: BattleItems[toID(serverPokemon.item)]?.name,
+            ability: BattleAbilities[toID(serverPokemon.ability || serverPokemon.baseAbility)]?.name,
+            boosts: clientPokemon && clientPokemon.boosts,
+            teraType: getTeraType(clientPokemon && clientPokemon.terastallized, me.terastallized, serverPokemon.terastallized),
+            status: getCalcStatus(me),
+            hpFraction: getHpFraction(me)
           },
           {
             species: speciesEnemy,
             set: dataEnemy,
             item: "mail",
-            boosts: enemy.boosts
+            boosts: enemy.boosts,
+            teraType: getTeraType(enemy.terastallized),
+            status: getCalcStatus(enemy),
+            hpFraction: getHpFraction(enemy)
           },
           clientMove.name
         );
@@ -241,31 +296,47 @@
         var attacker = {
           species: speciesMe,
           set: dataMe,
-          item: BattleItems[serverPokemon.item]?.name,
-          ability: BattleAbilities[serverPokemon.baseAbility]?.name
+          item: BattleItems[toID(serverPokemon.item)]?.name,
+          ability: BattleAbilities[toID(serverPokemon.ability || serverPokemon.baseAbility)]?.name,
+          // A Pokémon that terastallized earlier stays terastallized after switching out
+          teraType: getTeraType(serverPokemon.terastallized, clientPokemon && clientPokemon.terastallized),
+          status: getCalcStatus(serverPokemon),
+          hpFraction: getHpFraction(serverPokemon)
         };
         var defender = {
           species: speciesEnemy,
           set: dataEnemy,
           item: "mail",
-          boosts: enemy.boosts
+          boosts: enemy.boosts,
+          teraType: getTeraType(enemy.terastallized),
+          status: getCalcStatus(enemy),
+          hpFraction: getHpFraction(enemy)
         };
 
         var rows = '';
+        var hasDamage = false;
         for (var i = 0; i < serverPokemon.moves.length; i++) {
           var move = Dex.moves.get(serverPokemon.moves[i]);
-          // Same rule as the move tooltip: skip status moves / no base power
-          if (!move || !move.exists || !move.basePower || move.category === 'Status') continue;
-          try {
-            var range = calcMoveRange(battle, info, attacker, defender, move.name);
-            if (range) {
-              rows += '&#8226; ' + move.name + ': ' + range[0] + '% - ' + range[1] + '%<br />';
+          if (!move || !move.exists) continue;
+
+          var line = '&#8226; ' + move.name;
+          // Status moves and moves with no base power are listed without a number
+          if (move.basePower && move.category !== 'Status') {
+            try {
+              var range = calcMoveRange(battle, info, attacker, defender, move.name);
+              if (range) {
+                line += ': ' + range[0] + '% - ' + range[1] + '%';
+                hasDamage = true;
+              } else {
+                line += ': &mdash;';
+              }
+            } catch (e) {
+              console.debug(e);
             }
-          } catch (e) {
-            console.debug(e);
           }
+          rows += line + '<br />';
         }
-        if (!rows) return original;
+        if (!hasDamage) return original;
 
         var block = '<div style="border-top: 1px solid #888; background: #dedede">' +
           '<p class="section"><small>Damage vs ' + speciesEnemy.name + ':</small><br />' + rows + '</p>' +
