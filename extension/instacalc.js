@@ -252,29 +252,20 @@
         };
 
         var rows = '';
-        var hasDamage = false;
         for (var i = 0; i < serverPokemon.moves.length; i++) {
           var move = Dex.moves.get(serverPokemon.moves[i]);
-          if (!move || !move.exists) continue;
-
-          var line = '&#8226; ' + move.name;
-          // Status moves and moves with no base power are listed without a number
-          if (move.basePower && move.category !== 'Status') {
-            try {
-              var range = calcMoveRange(battle, info, attacker, defender, move.name);
-              if (range) {
-                line += ': ' + range[0] + '% - ' + range[1] + '%';
-                hasDamage = true;
-              } else {
-                line += ': &mdash;';
-              }
-            } catch (e) {
-              console.debug(e);
+          // Same rule as the move tooltip: skip status moves / no base power
+          if (!move || !move.exists || !move.basePower || move.category === 'Status') continue;
+          try {
+            var range = calcMoveRange(battle, info, attacker, defender, move.name);
+            if (range) {
+              rows += '&#8226; ' + move.name + ': ' + range[0] + '% - ' + range[1] + '%<br />';
             }
+          } catch (e) {
+            console.debug(e);
           }
-          rows += line + '<br />';
         }
-        if (!hasDamage) return original;
+        if (!rows) return original;
 
         var block = '<div style="border-top: 1px solid #888; background: #dedede">' +
           '<p class="section"><small>Damage vs ' + speciesEnemy.name + ':</small><br />' + rows + '</p>' +
