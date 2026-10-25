@@ -299,6 +299,19 @@ if (TOOLTIP) {
     return { value: spe, notes: notes };
   }
 
+  // Applies a stat stage (-6..+6) to a stat the way Showdown does
+  function applyStatStage(value, stage, gen) {
+    if (!stage) return value;
+    var boostTable = [1, 1.5, 2, 2.5, 3, 3.5, 4];
+    if (stage > 0) {
+      value *= boostTable[stage];
+    } else {
+      if (gen <= 2) boostTable = [1, 100 / 66, 2, 2.5, 100 / 33, 100 / 28, 4];
+      value /= boostTable[-stage];
+    }
+    return Math.floor(value);
+  }
+
   function displayStats(gen, letsgo, champions, species, data, level, noHP, clientPokemon) {
     var stats = {};
     for (var stat in species.baseStats) {
@@ -313,14 +326,43 @@ if (TOOLTIP) {
         champions);
     }
 
-    // The Pokémon's CURRENT Speed after stat stages, paralysis, Tailwind, etc.
-    var modifiedSpe = null;
+    // The Pokémon's CURRENT stats, after what we can actually see: stat stages, the Rock-in-sandstorm
+    // Special Defense and Ice-in-snow Defense boosts, and everything that affects Speed (paralysis,
+    // Tailwind, abilities...). Same order as Showdown's own calculateModifiedStats: stages, then weather.
+    var modified = {};
+    var anyModified = false;
     if (clientPokemon) {
       try {
-        var eff = getEffectiveSpeed(clientPokemon, stats.spe, data, gen);
-        if (eff && eff.value !== stats.spe) modifiedSpe = eff.value;
+        var battle = clientPokemon.side && clientPokemon.side.battle;
+        var weather = battle ? battle.weather : '';
+        if (battle && battle.abilityActive && battle.abilityActive(['Air Lock', 'Cloud Nine'])) weather = '';
+        var types = clientPokemon.getTypeList ? clientPokemon.getTypeList() : [];
+        for (var modStat of Dex.statNamesExceptHP) {
+          if (gen === 1 && modStat === 'spd') continue;
+          var value = stats[modStat];
+          if (modStat === 'spe') {
+            var eff = getEffectiveSpeed(clientPokemon, stats.spe, data, gen);
+            if (eff) value = eff.value;
+          } else {
+            var stage = clientPokemon.boosts && clientPokemon.boosts[gen === 1 && modStat === 'spa' ? 'spc' : modStat];
+            value = applyStatStage(value, stage, gen);
+            if (gen >= 4 && weather === 'sandstorm' && modStat === 'spd' && types.indexOf('Rock') !== -1) {
+              value = Math.floor(value * 1.5);
+            }
+            if (weather === 'snowscape' && modStat === 'def' && types.indexOf('Ice') !== -1) {
+              value = Math.floor(value * 1.5);
+            }
+            if (gen <= 1 && value > 999) value = 999;
+          }
+          if (value !== stats[modStat]) {
+            modified[modStat] = value;
+            anyModified = true;
+          }
+        }
       } catch (e) {
         console.debug(e);
+        modified = {};
+        anyModified = false;
       }
     }
 
@@ -337,9 +379,9 @@ if (TOOLTIP) {
         line += '' + BattleTextParser.statShortName(statLabel) + '&nbsp;</small>';
         var italic = !known && (statName === 'atk' || statName === 'spe');
         var shown = '' + stats[statName];
-        if (useModified && statName === 'spe') {
-          shown = '<strong class="' + (modifiedSpe < stats.spe ? 'stat-lowered' : 'stat-boosted') + '">' +
-            modifiedSpe + '</strong>';
+        if (useModified && statName in modified) {
+          shown = '<strong class="' + (modified[statName] < stats[statName] ? 'stat-lowered' : 'stat-boosted') + '">' +
+            modified[statName] + '</strong>';
         }
         line += (italic ? '<i>' : '') + shown + (italic ? '</i>' : '');
       }
@@ -347,7 +389,7 @@ if (TOOLTIP) {
     }
 
     var buf = statLine(false);
-    if (modifiedSpe !== null) {
+    if (anyModified) {
       buf += '<p><small>(After stat modifiers:)</small></p>' + statLine(true);
     }
     return buf;
