@@ -27,6 +27,8 @@
     var id = toID((species.forme === 'Gmax' || cosmetic)
       ? species.baseSpecies : species.battleOnly || species.name);
     if (id.startsWith('pikachu')) id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
+    // Maushold-Four is its own species in Showdown's dex, but the randbats data only has 'Maushold'
+    if (id === 'mausholdfour') id = 'maushold';
     return id;
   }
 
