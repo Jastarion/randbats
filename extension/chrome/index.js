@@ -301,6 +301,9 @@ if (TOOLTIP) {
     return { value: spe, notes: notes };
   }
 
+  // Each Ruin ability lowers one stat of every OTHER Pokémon on the field by 25% (gen 9)
+  var RUIN_ABILITIES = { atk: 'Tablets of Ruin', def: 'Sword of Ruin', spa: 'Vessel of Ruin', spd: 'Beads of Ruin' };
+
   // Applies a stat stage (-6..+6) to a stat the way Showdown does
   function applyStatStage(value, stage, gen) {
     if (!stage) return value;
@@ -339,6 +342,8 @@ if (TOOLTIP) {
         var weather = battle ? battle.weather : '';
         if (battle && battle.abilityActive && battle.abilityActive(['Air Lock', 'Cloud Nine'])) weather = '';
         var types = clientPokemon.getTypeList ? clientPokemon.getTypeList() : [];
+        // This Pokémon's own ability: a Ruin ability doesn't lower its bearer's own stat
+        var ownAbility = toID(clientPokemon.effectiveAbility ? clientPokemon.effectiveAbility() : clientPokemon.ability);
         for (var modStat of Dex.statNamesExceptHP) {
           if (gen === 1 && modStat === 'spd') continue;
           var value = stats[modStat];
@@ -351,8 +356,13 @@ if (TOOLTIP) {
             if (gen >= 4 && weather === 'sandstorm' && modStat === 'spd' && types.indexOf('Rock') !== -1) {
               value = Math.floor(value * 1.5);
             }
-            if (weather === 'snowscape' && modStat === 'def' && types.indexOf('Ice') !== -1) {
+            if ((weather === 'snowscape' || weather === 'snow') && modStat === 'def' && types.indexOf('Ice') !== -1) {
               value = Math.floor(value * 1.5);
+            }
+            // Ruin abilities on the field (mine, or this Pokémon's ally), as Showdown's own code does it
+            var ruin = RUIN_ABILITIES[modStat];
+            if (ruin && gen >= 9 && ownAbility !== toID(ruin) && battle && battle.abilityActive && battle.abilityActive(ruin)) {
+              value = Math.floor(value * 0.75);
             }
             if (gen <= 1 && value > 999) value = 999;
           }

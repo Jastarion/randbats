@@ -363,6 +363,10 @@
 
     var pseudo = (battle.pseudoWeather || []).map(function (p) { return p[0]; });
 
+    // Air Lock / Cloud Nine switch every weather effect off while they're on the field
+    var weather = battle.weather;
+    if (battle.abilityActive && battle.abilityActive(['Air Lock', 'Cloud Nine'])) weather = '';
+
     return new calc.Field({
       // Gravity grounds Levitate / Air Balloon holders, Magic Room switches held items off,
       // Wonder Room swaps Defense and Special Defense.
@@ -377,7 +381,7 @@
         isLightScreen: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.lightscreen),
         isReflect: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.reflect)
       },
-      weather: CALC_WEATHER[battle.weather],
+      weather: CALC_WEATHER[weather],
       terrain: terrain
     });
   }
@@ -421,6 +425,8 @@
       // (Tera STAB x1.333, new defensive typing, Tera Blast...). Gen 9 only.
       teraType: info.gen >= 9 ? p.teraType : undefined,
       status: p.status,
+      // Supreme Overlord (+10% per fainted ally) and Last Respects read this
+      alliesFainted: p.alliesFainted,
       // Typing that differs from the species' own (Transform, Soak, Burn Up...)
       overrides: p.types ? { types: p.types } : undefined
     });
@@ -476,9 +482,87 @@
     return [undefined];
   }
 
-  // One calculation; `hits` is undefined for the calc's default. Returns { range: [min, max], note }.
+  // How many Pokémon of a side have fainted (Supreme Overlord, Last Respects)
+  function getFaintedCount(side) {
+    var count = 0;
+    var list = (side && side.pokemon) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].fainted) count++;
+    }
+    return count;
+  }
+
+  // Stockpile layers (0-3), which the client tracks as the volatiles stockpile1 / stockpile2 / stockpile3
+  function getStockpileLayers(poke) {
+    var volatiles = (poke && poke.volatiles) || {};
+    if (volatiles['stockpile3']) return 3;
+    if (volatiles['stockpile2']) return 2;
+    return volatiles['stockpile1'] ? 1 : 0;
+  }
+
+  // Does this calc scale Last Respects with the number of fainted allies on its own? (Newer builds do;
+  // the one bundled with the extension doesn't.) Found out once per generation by trying it.
+  var NATIVE_FAINTED = {};
+  function calcScalesWithFainted(calcGen) {
+    var key = calcGen.num;
+    if (!(key in NATIVE_FAINTED)) {
+      var native = false;
+      try {
+        var run = function (fainted) {
+          var attacker = new calc.Pokemon(calcGen, 'Annihilape', { level: 100, alliesFainted: fainted });
+          var defender = new calc.Pokemon(calcGen, 'Gengar', { level: 100 });
+          return calc.calculate(calcGen, attacker, defender, new calc.Move(calcGen, 'Last Respects'), new calc.Field()).range()[1];
+        };
+        native = run(3) > run(0);
+      } catch (e) {}
+      NATIVE_FAINTED[key] = native;
+    }
+    return NATIVE_FAINTED[key];
+  }
+
+  // Base power the calc can't work out by itself: Last Respects (50 + 50 per fainted ally) and Spit Up
+  // (100 per Stockpile layer). Returns { bp, tag } or null.
+  function getBasePowerOverride(calcGen, attacker, moveName) {
+    var id = toID(moveName);
+    if (id === 'lastrespects' && !calcScalesWithFainted(calcGen)) {
+      var fainted = attacker.alliesFainted || 0;
+      return { bp: 50 + 50 * fainted, tag: fainted + ' fainted' };
+    }
+    if (id === 'spitup' && attacker.stockpile) {
+      return { bp: 100 * attacker.stockpile, tag: 'Stockpile x' + attacker.stockpile };
+    }
+    return null;
+  }
+
+  // One calculation; `hits` is undefined for the calc's default.
+  // Returns { range: [min, max], note, tags } (tags: short labels for modifiers worth showing).
   function calcOnce(battle, info, calcGen, attacker, defender, moveName, hits) {
-    var calcMove = new calc.Move(calcGen, moveName, hits ? { hits: hits } : undefined);
+    var moveData = calcGen.moves.get(toID(moveName));
+    var tags = [];
+
+    // Base power the calc doesn't know about
+    var override = getBasePowerOverride(calcGen, attacker, moveName);
+    var bp = override ? override.bp : undefined;
+    if (override && override.tag) tags.push(override.tag);
+
+    // Charge (the move, or Electromorphosis / Wind Power) doubles the power of the next Electric move.
+    // The bundled calc has no logic for it, so double the base power; moves whose power the calc works
+    // out itself (Electro Ball...) get the result doubled instead.
+    var chargeMultiplier = 1;
+    if (attacker.charged && moveData && moveData.type === 'Electric') {
+      tags.push('Charged');
+      var base = bp || moveData.basePower;
+      if (base > 0) bp = base * 2;
+      else chargeMultiplier = 2;
+    }
+
+    if (attacker.ability === 'Supreme Overlord' && attacker.alliesFainted) {
+      tags.push('Supreme Overlord: ' + attacker.alliesFainted + ' fainted');
+    }
+    var options = {};
+    if (hits) options.hits = hits;
+    if (bp) options.overrides = { basePower: bp };
+    var calcMove = new calc.Move(calcGen, moveName, hits || bp ? options : undefined);
     var result = calc.calculate(
       calcGen,
       makePokemon(info, calcGen, attacker),
@@ -490,21 +574,25 @@
     var hpStat = defender.hpFrom ? makePokemon(info, calcGen, defender.hpFrom).stats.hp : undefined;
     var range = getDamageRange(result, hpStat);
     if (!range) return null;
+    if (chargeMultiplier !== 1) {
+      range = [Math.round(range[0] * chargeMultiplier * 10) / 10, Math.round(range[1] * chargeMultiplier * 10) / 10];
+    }
 
     var blocker = getFirstHitBlocker(info, attacker, defender, calcMove);
     if (blocker) {
       var total = calcMove.hits > 1 ? calcMove.hits : 1;
       if (total === 1) {
         // Blocked entirely; the calc's number is what the NEXT hit would do
-        return { range: [0, 0], note: blocker + ', then ' + range[0] + '% - ' + range[1] + '%' };
+        return { range: [0, 0], note: blocker + ', then ' + range[0] + '% - ' + range[1] + '%', tags: tags };
       }
       var keep = (total - 1) / total; // only the first of the hits is blocked
       return {
         range: [Math.round(range[0] * keep * 10) / 10, Math.round(range[1] * keep * 10) / 10],
-        note: 'first hit blocked by ' + blocker
+        note: 'first hit blocked by ' + blocker,
+        tags: tags
       };
     }
-    return { range: range, note: undefined };
+    return { range: range, note: undefined, tags: tags };
   }
 
   // Returns [min%, max%, note?] or null. `note` explains a special case, e.g. "Disguise" or "4-5 hits".
@@ -515,16 +603,19 @@
     var min = Infinity;
     var max = -Infinity;
     var blockNote;
+    var tags = [];
     for (var i = 0; i < counts.length; i++) {
       var one = calcOnce(battle, info, calcGen, attacker, defender, moveName, counts[i]);
       if (!one) return null;
       min = Math.min(min, one.range[0]);
       max = Math.max(max, one.range[1]);
       blockNote = blockNote || one.note;
+      tags = one.tags;
     }
 
     var notes = [];
     if (counts.length > 1) notes.push(counts[0] + '-' + counts[counts.length - 1] + ' hits');
+    for (var t = 0; t < tags.length; t++) notes.push(tags[t]);
     if (blockNote) notes.push(blockNote);
     return [min, max, notes.length ? notes.join('; ') : undefined];
   }
@@ -549,8 +640,11 @@
         return;
       }
       if (!other || (other[0] === range[0] && other[1] === range[1])) return;
+      // Eviolite always gets its own line (it would otherwise merge with an Assault Vest line on special moves)
       for (var i = 0; i < groups.length; i++) {
-        if (groups[i].range[0] === other[0] && groups[i].range[1] === other[1]) {
+        var sameRange = groups[i].range[0] === other[0] && groups[i].range[1] === other[1];
+        var eviolite = label === 'Eviolite' || groups[i].labels.indexOf('Eviolite') !== -1;
+        if (sameRange && !eviolite) {
           groups[i].labels.push(label);
           return;
         }
@@ -559,12 +653,19 @@
     }
 
     (defender.abilityOptions || []).forEach(function (ability) {
+      // A "0% if Bulletproof" line is only worth showing once we know it has it (then the main number is 0%)
+      if (ability === 'Bulletproof') return;
       consider(ability, { ability: ability });
     });
     (defender.itemOptions || []).forEach(function (item) {
       consider(item === null ? 'no item' : item, { item: item === null ? undefined : item });
     });
-    return { range: range, alternatives: groups.slice(0, 3) };
+    // At most 3 lines, except that an Eviolite line is never dropped
+    var shown = groups.slice(0, 3);
+    groups.slice(3).forEach(function (group) {
+      if (group.labels.indexOf('Eviolite') !== -1) shown.push(group);
+    });
+    return { range: range, alternatives: shown };
   }
 
   // "a% - b%" plus the optional note in small print
@@ -579,14 +680,16 @@
     BattleTooltips.prototype.showMoveTooltip = function (clientMove, serverMove, clientPokemon, serverPokemon) {
       var original = TOOLTIPMOVE.apply(this, arguments);
       try {
-        // Skip status moves / moves with no base power
-        if (clientMove.basePower == 0 || clientMove.basePower == null) return original;
+        // Skip status moves / moves with no base power (Spit Up has none until Stockpile gives it some)
+        var spitUp = toID(clientMove.name) === 'spitup';
+        if (!spitUp && (clientMove.basePower == 0 || clientMove.basePower == null)) return original;
         if (!serverPokemon) return original;
 
         var battle = this.battle;
         var enemy = battle.farSide.active[0];
         var me = battle.mySide.active[0];
         if (!enemy || !me) return original;
+        if (spitUp && !getStockpileLayers(me)) return original; // Spit Up fails without Stockpile
 
         var info = getFormatInfo(battle);
         if (!info) return original;
@@ -611,7 +714,10 @@
             boosts: clientPokemon && clientPokemon.boosts,
             teraType: getTeraType(clientPokemon && clientPokemon.terastallized, me.terastallized, serverPokemon.terastallized),
             status: getCalcStatus(me),
-            hpFraction: getHpFraction(me)
+            hpFraction: getHpFraction(me),
+            alliesFainted: getFaintedCount(battle.mySide),
+            charged: !!(me.volatiles && me.volatiles['charge']),
+            stockpile: getStockpileLayers(me)
           },
           buildDefender(info, battle, enemy, speciesEnemy, dataEnemy),
           clientMove.name
@@ -685,7 +791,8 @@
           // A Pokémon that terastallized earlier stays terastallized after switching out
           teraType: getTeraType(serverPokemon.terastallized, clientPokemon && clientPokemon.terastallized),
           status: getCalcStatus(serverPokemon),
-          hpFraction: getHpFraction(serverPokemon)
+          hpFraction: getHpFraction(serverPokemon),
+          alliesFainted: getFaintedCount(battle.mySide)
         };
         var defender = buildDefender(info, battle, enemy, speciesEnemy, dataEnemy);
 
