@@ -303,6 +303,7 @@
       teraType: getTeraType(enemy.terastallized),
       status: getCalcStatus(enemy),
       hpFraction: getHpFraction(enemy),
+      level: enemy.level,
       types: getTypeOverride(enemy)
     };
 
@@ -417,7 +418,7 @@
     var mon = new calc.Pokemon(calcGen, p.species.name, {
       item: p.item,
       ability: p.ability,
-      level: p.set[0].level,
+      level: p.set[0].level || p.level,
       evs: stats.evs,
       ivs: stats.ivs,
       boosts: stats.boosts,
@@ -490,6 +491,44 @@
       if (list[i] && list[i].fainted) count++;
     }
     return count;
+  }
+
+  // The server data (exact stats, ability, item, moves) of one of MY Pokémon, matched to its client-side object.
+  // `battle.myPokemon` is replaced with every request. Returns null for the opponent's Pokémon and for spectators.
+  function findMyServerPokemon(battle, clientPokemon) {
+    var list = battle && battle.myPokemon;
+    if (!list || !clientPokemon || clientPokemon.side !== battle.mySide) return null;
+    var i;
+    if (battle.findCorrespondingPokemon) {
+      for (i = 0; i < list.length; i++) {
+        try {
+          if (battle.findCorrespondingPokemon(list[i]) === clientPokemon) return list[i];
+        } catch (e) {}
+      }
+    }
+    // The details part of the id changes (Terastallization, forme changes): fall back to the ident alone
+    var ident = String(clientPokemon.searchid || '').split('|')[0];
+    if (ident) {
+      for (i = 0; i < list.length; i++) {
+        if (list[i].ident === ident) return list[i];
+      }
+    }
+    return null;
+  }
+
+  // Explains in the browser console (DevTools, level "Verbose") why a damage calculation was skipped
+  function skip(original, why) {
+    console.debug('[randbats] damage calc skipped: ' + why);
+    return original;
+  }
+
+  // Moves that deal fixed or HP-based damage. Showdown gives them a base power of 0, so they used to be skipped
+  // as if they were status moves. The calc works all of these out itself: Seismic Toss and Night Shade deal the
+  // user's level, Dragon Rage 40, Sonic Boom 20, Nature's Madness half of the target's current HP, and Final
+  // Gambit the user's current HP. (Type immunities still apply; resistances and weaknesses don't.)
+  var FIXED_DAMAGE_MOVES = ['seismictoss', 'nightshade', 'dragonrage', 'sonicboom', 'naturesmadness', 'finalgambit'];
+  function isFixedDamageMove(moveName) {
+    return FIXED_DAMAGE_MOVES.indexOf(toID(moveName)) !== -1;
   }
 
   // Stockpile layers (0-3), which the client tracks as the volatiles stockpile1 / stockpile2 / stockpile3
@@ -670,7 +709,9 @@
 
   // "a% - b%" plus the optional note in small print
   function formatRange(range) {
-    return range[0] + '% - ' + range[1] + '%' + (range[2] ? ' <small>(' + range[2] + ')</small>' : '');
+    // Fixed damage (Seismic Toss...) has no spread: show a single number
+    var text = range[0] === range[1] && range[0] > 0 ? range[0] + '%' : range[0] + '% - ' + range[1] + '%';
+    return text + (range[2] ? ' <small>(' + range[2] + ')</small>' : '');
   }
 
   // ---------------------------------------------------------------------------
@@ -682,17 +723,17 @@
       try {
         // Skip status moves / moves with no base power (Spit Up has none until Stockpile gives it some)
         var spitUp = toID(clientMove.name) === 'spitup';
-        if (!spitUp && (clientMove.basePower == 0 || clientMove.basePower == null)) return original;
+        if (!spitUp && !isFixedDamageMove(clientMove.name) && (clientMove.basePower == 0 || clientMove.basePower == null)) return original;
         if (!serverPokemon) return original;
 
         var battle = this.battle;
         var enemy = battle.farSide.active[0];
         var me = battle.mySide.active[0];
-        if (!enemy || !me) return original;
+        if (!enemy || !me) return skip(original, 'no active Pokémon on one side');
         if (spitUp && !getStockpileLayers(me)) return original; // Spit Up fails without Stockpile
 
         var info = getFormatInfo(battle);
-        if (!info) return original;
+        if (!info) return skip(original, 'unsupported format ' + battle.tier);
 
         var speciesEnemy = Dex.species.get(enemy.speciesForme);
         if (!speciesEnemy) return original;
@@ -700,9 +741,9 @@
         if (!speciesMe) return original;
 
         var dataEnemy = getSetData(info, speciesEnemy, enemy.level);
-        if (!dataEnemy) return original;
+        if (!dataEnemy) return skip(original, 'no randbats data for the opponent (' + enemy.speciesForme + ' L' + enemy.level + ')');
         var dataMe = getSetData(info, speciesMe, me.level);
-        if (!dataMe) return original;
+        if (!dataMe) return skip(original, 'no randbats data for my Pokémon');
 
         var calculated = calcMoveWithAlternatives(
           battle, info,
@@ -715,6 +756,7 @@
             teraType: getTeraType(clientPokemon && clientPokemon.terastallized, me.terastallized, serverPokemon.terastallized),
             status: getCalcStatus(me),
             hpFraction: getHpFraction(me),
+            level: me.level,
             alliesFainted: getFaintedCount(battle.mySide),
             charged: !!(me.volatiles && me.volatiles['charge']),
             stockpile: getStockpileLayers(me)
@@ -758,8 +800,18 @@
   // Added right after the moves list.
   // ---------------------------------------------------------------------------
   if (TOOLTIPPOKEMON) {
-    BattleTooltips.prototype.showPokemonTooltip = function (clientPokemon, serverPokemon, isActive) {
-      var original = TOOLTIPPOKEMON.apply(this, arguments);
+    BattleTooltips.prototype.showPokemonTooltip = function (clientPokemon, serverPokemon, isActive, illusionIndex) {
+      // The client's sidebar (team icon) hover passes NO server data, even for my own Pokémon, so they show up with an
+      // unknown ability and stat ranges, whereas the active sprite and the switch buttons (which only exist while
+      // choosing a move) show the real values. Look the data up so my own Pokémon always show their real values.
+      if (!serverPokemon && !illusionIndex) {
+        var ownServerPokemon = findMyServerPokemon(this.battle, clientPokemon);
+        if (ownServerPokemon) {
+          serverPokemon = ownServerPokemon;
+          if (isActive === undefined) isActive = !!ownServerPokemon.active;
+        }
+      }
+      var original = TOOLTIPPOKEMON.call(this, clientPokemon, serverPokemon, isActive, illusionIndex);
       try {
         // Only my own Pokémon (their moves are known) that are not currently out.
         // The Pokémon that is out already gets the calc on its move tooltips.
@@ -771,7 +823,7 @@
         if (!enemy) return original;
 
         var info = getFormatInfo(battle);
-        if (!info) return original;
+        if (!info) return skip(original, 'unsupported format ' + battle.tier);
 
         var speciesEnemy = Dex.species.get(enemy.speciesForme);
         if (!speciesEnemy) return original;
@@ -779,9 +831,9 @@
         if (!speciesMe) return original;
 
         var dataEnemy = getSetData(info, speciesEnemy, enemy.level);
-        if (!dataEnemy) return original;
+        if (!dataEnemy) return skip(original, 'no randbats data for the opponent (' + enemy.speciesForme + ' L' + enemy.level + ')');
         var dataMe = getSetData(info, speciesMe, serverPokemon.level);
-        if (!dataMe) return original;
+        if (!dataMe) return skip(original, 'no randbats data for my Pokémon');
 
         var attacker = {
           species: speciesMe,
@@ -792,6 +844,7 @@
           teraType: getTeraType(serverPokemon.terastallized, clientPokemon && clientPokemon.terastallized),
           status: getCalcStatus(serverPokemon),
           hpFraction: getHpFraction(serverPokemon),
+          level: serverPokemon.level,
           alliesFainted: getFaintedCount(battle.mySide)
         };
         var defender = buildDefender(info, battle, enemy, speciesEnemy, dataEnemy);
@@ -804,7 +857,7 @@
 
           var line = '&#8226; ' + move.name;
           // Status moves and moves with no base power are listed without a number
-          if (move.basePower && move.category !== 'Status') {
+          if ((move.basePower || isFixedDamageMove(move.name)) && move.category !== 'Status') {
             try {
               var calculated = calcMoveWithAlternatives(battle, info, attacker, defender, move.name);
               if (calculated) {
