@@ -55,12 +55,61 @@ if (TOOLTIP) {
     })(format);
   }
 
-  BattleTooltips.prototype.showPokemonTooltip = function (clientPokemon, serverPokemon) {
-    var original = TOOLTIP.apply(this, arguments);
+  // Battles in which we have seen that the user is a PLAYER. The client only has "server data" for the
+  // player's own Pokémon (battle.myPokemon, replaced with every request), and that data is briefly missing
+  // when the client rewinds or replays the battle. Without it, the player's own Pokémon would look like an
+  // unknown opponent and get randbats "possible sets" info.
+  var PLAYER_BATTLES = typeof WeakSet === 'function' ? new WeakSet() : null;
+
+  // The server data (exact stats, ability, item, moves) of one of MY Pokémon, matched to its client-side object.
+  // `battle.myPokemon` is replaced with every request. Returns null for the opponent's Pokémon and for spectators.
+  function findMyServerPokemon(battle, clientPokemon) {
+    var list = battle && battle.myPokemon;
+    if (!list || !clientPokemon || clientPokemon.side !== battle.mySide) return null;
+    var i;
+    if (battle.findCorrespondingPokemon) {
+      for (i = 0; i < list.length; i++) {
+        try {
+          if (battle.findCorrespondingPokemon(list[i]) === clientPokemon) return list[i];
+        } catch (e) {}
+      }
+    }
+    // The details part of the id changes (Terastallization, forme changes): fall back to the ident alone
+    var ident = String(clientPokemon.searchid || '').split('|')[0];
+    if (ident) {
+      for (i = 0; i < list.length; i++) {
+        if (list[i].ident === ident) return list[i];
+      }
+    }
+    return null;
+  }
+
+  // Explains in the browser console (DevTools, level "Verbose") why a tooltip was left as it is
+  function notEnhanced(original, why) {
+    console.debug('[randbats] tooltip not enhanced: ' + why);
+    return original;
+  }
+
+  BattleTooltips.prototype.showPokemonTooltip = function (clientPokemon, serverPokemon, isActive, illusionIndex) {
+    // The client's sidebar (team icon) hover passes NO server data, even for my own Pokémon, so they show up with an
+    // unknown ability and stat ranges, whereas the active sprite and the switch buttons (which only exist while
+    // choosing a move) show the real values. Look the data up so my own Pokémon always show their real values.
+    if (!serverPokemon && !illusionIndex) {
+      var ownServerPokemon = findMyServerPokemon(this.battle, clientPokemon);
+      if (ownServerPokemon) {
+        serverPokemon = ownServerPokemon;
+        if (isActive === undefined) isActive = !!ownServerPokemon.active;
+      }
+    }
+    var original = TOOLTIP.call(this, clientPokemon, serverPokemon, isActive, illusionIndex);
+    if (PLAYER_BATTLES && (serverPokemon || this.battle.myPokemon)) PLAYER_BATTLES.add(this.battle);
     if (!clientPokemon || serverPokemon) return original;
+    if (PLAYER_BATTLES && PLAYER_BATTLES.has(this.battle) && clientPokemon.side === this.battle.mySide) {
+      return notEnhanced(original, 'your own Pokémon');
+    }
 
     var format = toID(this.battle.tier);
-    if (!format || !format.includes('random')) return original;
+    if (!format || !format.includes('random')) return notEnhanced(original, 'not a random battle (' + this.battle.tier + ')');
 
     var gen = Number(format.charAt(3));
     var letsgo = format.includes('letsgo');
@@ -71,7 +120,7 @@ if (TOOLTIP) {
       clientPokemon.volatiles.formechange
       ? clientPokemon.volatiles.formechange[1]
       : clientPokemon.speciesForme);
-    if (!species) return original;
+    if (!species) return notEnhanced(original, 'unknown species ' + clientPokemon.speciesForme);
 
     if (!['singles', 'doubles'].includes(gameType)) {
       format = 'gen' + gen + (champions ? 'champions' : '') + 'randomdoublesbattle';
@@ -80,10 +129,10 @@ if (TOOLTIP) {
     } else if (format.endsWith('blitz')) {
       format = format.slice(0, -5);
     }
-    if (!DATA[format]) return original;
+    if (!DATA[format]) return notEnhanced(original, 'no randbats data loaded for ' + format);
 
     var data = DATA[format][species.baseSpecies === 'Zoroark' ? 0 : clientPokemon.level];
-    if (!data) return original;
+    if (!data) return notEnhanced(original, 'no data for level ' + clientPokemon.level + ' in ' + format);
 
     var cosmetic = species.cosmeticFormes && species.cosmeticFormes.includes(species.name);
     var id = toID((species.forme === 'Gmax' || cosmetic)
@@ -96,7 +145,7 @@ if (TOOLTIP) {
 
     var d = data;
     data = data[id];
-    if (!data) return original;
+    if (!data) return notEnhanced(original, 'no set data for ' + id + ' at level ' + clientPokemon.level);
 
     if (id === 'greninja' && 'greninjabond' in d) {
       data = data.concat(d['greninjabond']);
