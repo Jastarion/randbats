@@ -522,13 +522,17 @@
     return original;
   }
 
-  // Moves that deal fixed or HP-based damage. Showdown gives them a base power of 0, so they used to be skipped
-  // as if they were status moves. The calc works all of these out itself: Seismic Toss and Night Shade deal the
-  // user's level, Dragon Rage 40, Sonic Boom 20, Nature's Madness half of the target's current HP, and Final
-  // Gambit the user's current HP. (Type immunities still apply; resistances and weaknesses don't.)
-  var FIXED_DAMAGE_MOVES = ['seismictoss', 'nightshade', 'dragonrage', 'sonicboom', 'naturesmadness', 'finalgambit'];
-  function isFixedDamageMove(moveName) {
-    return FIXED_DAMAGE_MOVES.indexOf(toID(moveName)) !== -1;
+  // Moves whose damage or power the calc works out by itself. Showdown gives them a base power of 0, so they
+  // used to be skipped as if they were status moves.
+  //  - Fixed / HP-based damage: Seismic Toss and Night Shade deal the user's level, Dragon Rage 40, Sonic Boom 20,
+  //    Nature's Madness half of the target's current HP, Final Gambit the user's current HP. (Type immunities still
+  //    apply; resistances and weaknesses don't.)
+  //  - Weight-based power: Low Kick and Grass Knot use the TARGET's weight (20 to 120 power), Heavy Slam and Heat
+  //    Crash the ratio of the user's weight to the target's. Heavy Metal, Light Metal and Float Stone count.
+  var CALC_COMPUTED_MOVES = ['seismictoss', 'nightshade', 'dragonrage', 'sonicboom', 'naturesmadness', 'finalgambit',
+    'lowkick', 'grassknot', 'heavyslam', 'heatcrash'];
+  function isCalcComputedMove(moveName) {
+    return CALC_COMPUTED_MOVES.indexOf(toID(moveName)) !== -1;
   }
 
   // Stockpile layers (0-3), which the client tracks as the volatiles stockpile1 / stockpile2 / stockpile3
@@ -723,7 +727,7 @@
       try {
         // Skip status moves / moves with no base power (Spit Up has none until Stockpile gives it some)
         var spitUp = toID(clientMove.name) === 'spitup';
-        if (!spitUp && !isFixedDamageMove(clientMove.name) && (clientMove.basePower == 0 || clientMove.basePower == null)) return original;
+        if (!spitUp && !isCalcComputedMove(clientMove.name) && (clientMove.basePower == 0 || clientMove.basePower == null)) return original;
         if (!serverPokemon) return original;
 
         var battle = this.battle;
@@ -857,7 +861,7 @@
 
           var line = '&#8226; ' + move.name;
           // Status moves and moves with no base power are listed without a number
-          if ((move.basePower || isFixedDamageMove(move.name)) && move.category !== 'Status') {
+          if ((move.basePower || isCalcComputedMove(move.name)) && move.category !== 'Status') {
             try {
               var calculated = calcMoveWithAlternatives(battle, info, attacker, defender, move.name);
               if (calculated) {
