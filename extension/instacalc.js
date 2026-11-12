@@ -26,7 +26,8 @@
     var cosmetic = species.cosmeticFormes && species.cosmeticFormes.includes(species.name);
     var id = toID((species.forme === 'Gmax' || cosmetic)
       ? species.baseSpecies : species.battleOnly || species.name);
-    if (id.startsWith('pikachu')) id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
+    // (Let's Go has its own Pikachu-Starter entry, which must stay as it is)
+    if (id.startsWith('pikachu') && id !== 'pikachustarter') id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
     // Maushold-Four is its own species in Showdown's dex, but the randbats data only has 'Maushold'
     if (id === 'mausholdfour') id = 'maushold';
     return id;
@@ -70,7 +71,8 @@
 
   // Looks up the randbats set data for a species at a given level
   function getSetData(info, species, level) {
-    var byLevel = DATA[info.format][species.name === 'Zoroark' ? 0 : level];
+    // Zoroark hides its level behind Illusion, so the data stores every Zoroark forme under level 0
+    var byLevel = DATA[info.format][species.baseSpecies === 'Zoroark' || species.name === 'Zoroark' ? 0 : level];
     if (!byLevel) return null;
     return byLevel[getSpeciesId(species)] || null;
   }
@@ -268,10 +270,8 @@
   function getBattleSpecies(info, clientPokemon, baseSpecies) {
     var forme = clientPokemon.getSpeciesForme ? clientPokemon.getSpeciesForme() : clientPokemon.speciesForme;
     if (!forme || forme === clientPokemon.speciesForme || /-Gmax$/.test(forme)) return baseSpecies;
-    var species = Dex.species.get(forme);
-    if (!species) return baseSpecies;
-    var known = calc.Generations.get(info.gen).species.get(toID(species.name));
-    return known ? species : baseSpecies;
+    // (A species the calc doesn't know is rebuilt from Showdown's data by getCalcSpecies)
+    return Dex.species.get(forme) || baseSpecies;
   }
 
   // Typing to force on the defender when it differs from its species' own: Transform copies the target's
@@ -351,7 +351,29 @@
     return undefined;
   }
 
-  function buildField(battle) {
+  // These moves destroy the target's Reflect / Light Screen / Aurora Veil BEFORE they deal damage, so the screens
+  // never reduce them. (The calc bundled with the extension doesn't know that.)
+  var SCREEN_BREAKERS = ['brickbreak', 'psychicfangs', 'ragingbull'];
+
+  // Moves that hit several Pokémon are cut to 75% in doubles, but only when they really have 2+ targets. The calc
+  // applies it whenever the move is a spread move, so when there is only one target left we turn it into a
+  // single-target move for the calculation. Returns true in that case.
+  function hasSingleTarget(battle, moveData) {
+    var target = moveData && moveData.target;
+    if (!battle.gameType || battle.gameType === 'singles') return false;
+    if (target !== 'allAdjacentFoes' && target !== 'allAdjacent') return false;
+    var alive = function (list, skip) {
+      var n = 0;
+      for (var i = 0; i < (list || []).length; i++) if (list[i] && !list[i].fainted && list[i] !== skip) n++;
+      return n;
+    };
+    var targets = alive(battle.farSide && battle.farSide.active);
+    // Earthquake and friends also hit my own ally
+    if (target === 'allAdjacent') targets += Math.max(0, alive(battle.mySide && battle.mySide.active) - 1);
+    return targets <= 1;
+  }
+
+  function buildField(battle, moveName) {
     var mySide = battle.mySide;
     var farSide = battle.farSide;
 
@@ -368,7 +390,11 @@
     var weather = battle.weather;
     if (battle.abilityActive && battle.abilityActive(['Air Lock', 'Cloud Nine'])) weather = '';
 
+    var breaksScreens = SCREEN_BREAKERS.indexOf(toID(moveName)) !== -1;
+
     return new calc.Field({
+      // Doubles changes how much the screens reduce (2/3 instead of 1/2) and enables the spread-move reduction
+      gameType: battle.gameType && battle.gameType !== 'singles' ? 'Doubles' : 'Singles',
       // Gravity grounds Levitate / Air Balloon holders, Magic Room switches held items off,
       // Wonder Room swaps Defense and Special Defense.
       isGravity: pseudo.indexOf('Gravity') !== -1,
@@ -379,8 +405,8 @@
         isReflect: !!(mySide.sideConditions.auroraveil || mySide.sideConditions.reflect)
       },
       defenderSide: {
-        isLightScreen: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.lightscreen),
-        isReflect: !!(farSide.sideConditions.auroraveil || farSide.sideConditions.reflect)
+        isLightScreen: !breaksScreens && !!(farSide.sideConditions.auroraveil || farSide.sideConditions.lightscreen),
+        isReflect: !breaksScreens && !!(farSide.sideConditions.auroraveil || farSide.sideConditions.reflect)
       },
       weather: CALC_WEATHER[weather],
       terrain: terrain
@@ -413,10 +439,43 @@
   }
 
   // p = { species, set, item, ability, boosts, teraType, status, hpFraction }
+  // The calc is older than the game (it doesn't have the Champions Mega formes, and it calls Aegislash
+  // "Aegislash-Shield"), so a species can be missing from it. Those are rebuilt from Showdown's own species
+  // data (stats, typing, weight) on top of a species the calc does know, instead of failing.
+  var CALC_SPECIES_ALIASES = { aegislash: 'Aegislash-Shield' };
+  function getCalcSpecies(calcGen, species) {
+    var id = toID(species.name);
+    if (calcGen.species.get(id)) return { name: species.name };
+    var alias = CALC_SPECIES_ALIASES[id];
+    if (alias && calcGen.species.get(toID(alias))) return { name: alias };
+
+    var overrides = {};
+    var stats = species.baseStats;
+    if (stats) overrides.baseStats = { hp: stats.hp, atk: stats.atk, def: stats.def, spa: stats.spa, spd: stats.spd, spe: stats.spe };
+    if (species.types && species.types.length) overrides.types = [species.types[0], species.types[1] || '???'];
+    if (species.weightkg) overrides.weightkg = species.weightkg;
+    overrides.nfe = !!(species.nfe || (species.evos && species.evos.length));
+    return { name: calcGen.species.get(toID(species.baseSpecies)) ? species.baseSpecies : 'Pikachu', overrides: overrides };
+  }
+
+  // The calc throws on an item it has no data for (it looks every item up while working out Knock Off), and it
+  // is older than the game: the Champions Mega Stones, for example, are missing. A Mega Stone can't be knocked
+  // off and does nothing else we model, so it becomes "no item"; any other unknown item becomes a plain
+  // removable placeholder.
+  function getCalcItem(calcGen, item, species) {
+    if (!item || !calcGen.items || !calcGen.items.get || calcGen.items.get(toID(item))) return item;
+    var isMega = /^Mega/.test(species.forme || '') || /-Mega/.test(species.name || '');
+    return isMega ? undefined : 'mail';
+  }
+
   function makePokemon(info, calcGen, p) {
     var stats = getEvsIvsBoosts(p.species.baseStats, p.set[0], p.boosts, info.gen, info.letsgo, info.champions);
-    var mon = new calc.Pokemon(calcGen, p.species.name, {
-      item: p.item,
+    var calcSpecies = getCalcSpecies(calcGen, p.species);
+    var overrides = calcSpecies.overrides ? Object.assign({}, calcSpecies.overrides) : {};
+    // Typing that differs from the species' own (Transform, Soak, Burn Up...)
+    if (p.types) overrides.types = p.types;
+    var mon = new calc.Pokemon(calcGen, calcSpecies.name, {
+      item: getCalcItem(calcGen, p.item, p.species),
       ability: p.ability,
       level: p.set[0].level || p.level,
       evs: stats.evs,
@@ -428,8 +487,7 @@
       status: p.status,
       // Supreme Overlord (+10% per fainted ally) and Last Respects read this
       alliesFainted: p.alliesFainted,
-      // Typing that differs from the species' own (Transform, Soak, Burn Up...)
-      overrides: p.types ? { types: p.types } : undefined
+      overrides: Object.keys(overrides).length ? overrides : undefined
     });
 
     // Current HP matters for Blaze/Torrent/Overgrow/Swarm, Eruption, Reversal, Brine...
@@ -514,6 +572,44 @@
       }
     }
     return null;
+  }
+
+  // The first opposing Pokémon that is still in the battle (in doubles the first slot can be empty or fainted)
+  function getFoe(battle) {
+    var list = (battle.farSide && battle.farSide.active) || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && !list[i].fainted) return list[i];
+    }
+    return list[0];
+  }
+
+  function escapeRegExp(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // The client lists a Pokémon's moves as "&#8226; Name<br />" (sometimes with a PP note before the <br />).
+  // Adds each move's damage to its own line, the "If ..." alternatives right under it, and a one-line heading
+  // above the list. Returns null if any damaging move's line can't be found (the caller then falls back to a
+  // separate block), so the tooltip is never left half-edited.
+  function mergeIntoMoveList(html, entries, heading) {
+    // The heading goes right above the first move (whatever it is; the list is in the client's order).
+    // Done first, while that move's line is still exactly as the client wrote it.
+    var firstBullet = new RegExp('&#8226; ' + escapeRegExp(entries[0].name) + '(?=[\\s<]|$)');
+    if (!firstBullet.test(html)) return null;
+    var result = html.replace(firstBullet, function (all) { return heading + '<br />' + all; });
+
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      if (!entry.text) continue;
+      var line = new RegExp('(&#8226; ' + escapeRegExp(entry.name) + ')(?=[\\s<]|$)([\\s\\S]*?)<br />');
+      if (!line.test(result)) return null;
+      result = result.replace(line, function (all, name, rest) {
+        var out = name + ': ' + entry.text + rest + '<br />';
+        entry.extra.forEach(function (x) { out += '&nbsp;&nbsp;' + x + '<br />'; });
+        return out;
+      });
+    }
+    return result;
   }
 
   // Explains in the browser console (DevTools, level "Verbose") why a damage calculation was skipped
@@ -604,14 +700,17 @@
     }
     var options = {};
     if (hits) options.hits = hits;
-    if (bp) options.overrides = { basePower: bp };
-    var calcMove = new calc.Move(calcGen, moveName, hits || bp ? options : undefined);
+    var moveOverrides = {};
+    if (bp) moveOverrides.basePower = bp;
+    if (hasSingleTarget(battle, moveData)) moveOverrides.target = 'normal';
+    if (Object.keys(moveOverrides).length) options.overrides = moveOverrides;
+    var calcMove = new calc.Move(calcGen, moveName, Object.keys(options).length ? options : undefined);
     var result = calc.calculate(
       calcGen,
       makePokemon(info, calcGen, attacker),
       makePokemon(info, calcGen, defender),
       calcMove,
-      buildField(battle)
+      buildField(battle, moveName)
     );
     console.debug(result);
     var hpStat = defender.hpFrom ? makePokemon(info, calcGen, defender.hpFrom).stats.hp : undefined;
@@ -731,8 +830,9 @@
         if (!serverPokemon) return original;
 
         var battle = this.battle;
-        var enemy = battle.farSide.active[0];
-        var me = battle.mySide.active[0];
+        var enemy = getFoe(battle);
+        // The Pokémon whose move this is (in doubles it can be the second one)
+        var me = clientPokemon || battle.mySide.active[0];
         if (!enemy || !me) return skip(original, 'no active Pokémon on one side');
         if (spitUp && !getStockpileLayers(me)) return original; // Spit Up fails without Stockpile
 
@@ -823,8 +923,8 @@
         if (!serverPokemon.moves || !serverPokemon.moves.length) return original;
 
         var battle = this.battle;
-        var enemy = battle.farSide.active[0];
-        if (!enemy) return original;
+        var enemy = getFoe(battle);
+        if (!enemy) return skip(original, 'no opposing Pokémon');
 
         var info = getFormatInfo(battle);
         if (!info) return skip(original, 'unsupported format ' + battle.tier);
@@ -853,36 +953,50 @@
         };
         var defender = buildDefender(info, battle, enemy, speciesEnemy, dataEnemy);
 
-        var rows = '';
+        // One entry per move: what to add to its line (the number) and the "If ..." lines to put under it
+        var entries = [];
         var hasDamage = false;
         for (var i = 0; i < serverPokemon.moves.length; i++) {
           var move = Dex.moves.get(serverPokemon.moves[i]);
           if (!move || !move.exists) continue;
 
-          var line = '&#8226; ' + move.name;
+          var text = '';
+          var extra = [];
           // Status moves and moves with no base power are listed without a number
           if ((move.basePower || isCalcComputedMove(move.name)) && move.category !== 'Status') {
             try {
               var calculated = calcMoveWithAlternatives(battle, info, attacker, defender, move.name);
               if (calculated) {
-                line += ': ' + formatRange(calculated.range);
+                text = formatRange(calculated.range);
                 calculated.alternatives.forEach(function (alt) {
-                  line += '<br />&nbsp;&nbsp;<small>If ' + alt.labels.join(' / ') + ':</small> ' + formatRange(alt.range);
+                  extra.push('<small>If ' + alt.labels.join(' / ') + ':</small> ' + formatRange(alt.range));
                 });
                 hasDamage = true;
               } else {
-                line += ': &mdash;';
+                text = '&mdash;';
               }
             } catch (e) {
               console.debug(e);
             }
           }
-          rows += line + '<br />';
+          entries.push({ name: move.name, text: text, extra: extra });
         }
-        if (!hasDamage) return original;
+        if (!hasDamage) return skip(original, 'no damaging move to calculate');
 
+        var heading = '<small>Damage vs ' + defender.species.name + ':</small>';
+
+        // Preferred: put the numbers on the client's own move lines, so the moves aren't listed twice
+        var merged = mergeIntoMoveList(original, entries, heading);
+        if (merged) return merged;
+
+        // Fallback (the client's move list wasn't recognised): a separate block after the moves
+        var rows = entries.map(function (entry) {
+          var line = '&#8226; ' + entry.name + (entry.text ? ': ' + entry.text : '');
+          entry.extra.forEach(function (x) { line += '<br />&nbsp;&nbsp;' + x; });
+          return line + '<br />';
+        }).join('');
         var block = '<div style="border-top: 1px solid #888; background: #dedede">' +
-          '<p class="section"><small>Damage vs ' + defender.species.name + ':</small><br />' + rows + '</p>' +
+          '<p class="section">' + heading + '<br />' + rows + '</p>' +
           '</div>';
 
         // Insert inside the tooltip, right after the moves (before the closing tags)
