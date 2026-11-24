@@ -134,15 +134,13 @@ if (TOOLTIP) {
     var data = DATA[format][species.baseSpecies === 'Zoroark' ? 0 : clientPokemon.level];
     if (!data) return notEnhanced(original, 'no data for level ' + clientPokemon.level + ' in ' + format);
 
-    var cosmetic = species.cosmeticFormes && species.cosmeticFormes.includes(species.name);
-    var id = toID((species.forme === 'Gmax' || cosmetic)
+    var id = toID(species.forme === 'Gmax'
       ? species.baseSpecies : species.battleOnly || species.name);
-    // (Let's Go has its own Pikachu-Starter entry, which must stay as it is)
-    if (id.startsWith('pikachu') && id !== 'pikachustarter') id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
-    // Maushold-Four is its own species in Showdown's dex, but the randbats data only has 'Maushold'
-    if (id === 'mausholdfour') id = 'maushold';
-    var forme = cosmetic ? species.baseSpecies : clientPokemon.speciesForme;
-    if (forme.startsWith('Pikachu')) forme = forme.endsWith('Gmax') ? 'Pikachu-Gmax' : 'Pikachu';
+    var forme = clientPokemon.speciesForme;
+    if (!data[id]) {
+      id = toID(species.baseSpecies);
+      forme = species.baseSpecies;
+    }
 
     var d = data;
     data = data[id];
