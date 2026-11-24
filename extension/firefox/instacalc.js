@@ -23,14 +23,7 @@
 
   // Resolves the key used to look a species up in the randbats DATA tables
   function getSpeciesId(species) {
-    var cosmetic = species.cosmeticFormes && species.cosmeticFormes.includes(species.name);
-    var id = toID((species.forme === 'Gmax' || cosmetic)
-      ? species.baseSpecies : species.battleOnly || species.name);
-    // (Let's Go has its own Pikachu-Starter entry, which must stay as it is)
-    if (id.startsWith('pikachu') && id !== 'pikachustarter') id = id.endsWith('gmax') ? 'pikachugmax' : 'pikachu';
-    // Maushold-Four is its own species in Showdown's dex, but the randbats data only has 'Maushold'
-    if (id === 'mausholdfour') id = 'maushold';
-    return id;
+    return toID(species.forme === 'Gmax' ? species.baseSpecies : species.battleOnly || species.name);
   }
 
   // Builds the EVs / IVs / boosts objects the calc expects
@@ -74,7 +67,9 @@
     // Zoroark hides its level behind Illusion, so the data stores every Zoroark forme under level 0
     var byLevel = DATA[info.format][species.baseSpecies === 'Zoroark' || species.name === 'Zoroark' ? 0 : level];
     if (!byLevel) return null;
-    return byLevel[getSpeciesId(species)] || null;
+    // A forme with no data of its own (Maushold-Four, Pikachu's cosmetic formes...) uses its base species' data,
+    // exactly like the tooltip does
+    return byLevel[getSpeciesId(species)] || byLevel[toID(species.baseSpecies)] || null;
   }
 
   // ---------------------------------------------------------------------------
